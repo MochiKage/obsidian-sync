@@ -11,6 +11,8 @@ import json
 import os
 import re
 import subprocess
+import threading
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -21,6 +23,39 @@ from sync import Config, ADB, ObsidianSync, GitManager, SyncState, STATE_PATH_TE
 
 app = Flask(__name__)
 app.secret_key = "obsidian-sync-dashboard"
+
+
+@app.errorhandler(Exception)
+def handle_unhandled_error(e):
+    """Catch any unhandled Flask exception and persist to error log."""
+    log_error(f"Unhandled Flask error: {e}", exc_info=__import__("sys").exc_info())
+    return jsonify({"ok": False, "error": str(e), "status": "error"}), 500
+
+# ── Global Error Logger ────────────────────────────────────────────────────────
+
+ERROR_LOG_PATH = Path(__file__).resolve().parent / ".sync_errors.log"
+_error_log_lock = threading.Lock()
+
+
+def log_error(message, exc_info=None):
+    """Append an error entry to .sync_errors.log with timestamp and traceback."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{ts}] {message}\n"
+    if exc_info:
+        entry += "".join(traceback.format_exception(*exc_info)) + "\n"
+    else:
+        entry += f"  (no traceback)\n"
+    entry += "-" * 60 + "\n"
+
+    with _error_log_lock:
+        try:
+            with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(entry)
+        except OSError:
+            pass  # can't log — nothing we can do
+
+    # Also print to stderr so it appears in the server console
+    print(entry, file=__import__("sys").stderr, end="")
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -57,6 +92,60 @@ class AppState:
 
 
 state = AppState()
+
+
+# ── Scan Cache ─────────────────────────────────────────────────────────────────
+# Page loads trigger multiple API calls (status, files, health) simultaneously.
+# Without caching, each call triggers _scan_pc() which walks the entire vault.
+# A short-lived cache avoids redundant I/O within a single page-load burst.
+
+_scan_cache: dict[str, tuple[float, dict]] = {}  # key -> (timestamp, result)
+_CACHE_TTL = 30.0  # seconds — 页面内多次请求共享扫描结果
+
+
+def _cached_scan_pc(compute_hash: bool = False):
+    """Call _scan_pc with caching. Dashboard never needs MD5 hashes."""
+    cache_key = "pc_scan"
+    now = datetime.now().timestamp()
+    if cache_key in _scan_cache:
+        ts, data = _scan_cache[cache_key]
+        if now - ts < _CACHE_TTL:
+            return data
+    data = state.sync_engine._scan_pc(compute_hash=compute_hash)
+    _scan_cache[cache_key] = (now, data)
+    return data
+
+
+def _cached_scan_tablet():
+    cache_key = "tablet_scan"
+    now = datetime.now().timestamp()
+    if cache_key in _scan_cache:
+        ts, data = _scan_cache[cache_key]
+        if now - ts < _CACHE_TTL:
+            return data
+    data = state.sync_engine._scan_tablet()
+    _scan_cache[cache_key] = (now, data)
+    return data
+
+
+def _clear_scan_cache():
+    _scan_cache.clear()
+
+
+# ── Staging Area ───────────────────────────────────────────────────────────────
+# Files selected by the user for the next sync. When non-empty, only staged
+# files are synced. After a successful sync, the staging area is cleared.
+
+_staged_files: set[str] = set()
+
+# ── Background Sync Jobs ────────────────────────────────────────────────────────
+# Sync can take a long time (scanning tablet files via ADB, computing MD5 hashes).
+# Running it synchronously in a Flask request handler blocks the entire server and
+# causes the HTTP request to time out. Instead, we spawn a background thread and
+# let the frontend poll for completion.
+
+_sync_jobs: dict[str, dict] = {}  # job_id -> {status, output, ok, ...}
+_sync_lock = threading.Lock()
 
 
 # ── Sync Logger ────────────────────────────────────────────────────────────────
@@ -152,6 +241,7 @@ def _iso(ts: float | None) -> str | None:
 
 @app.route("/api/status")
 def api_status():
+    # Fast file count without reading file contents
     pc_count = 0
     if state.vault.is_dir():
         pc_count = sum(1 for _ in state.vault.rglob("*") if _.is_file()
@@ -166,16 +256,16 @@ def api_status():
             raw = state.adb.get_files(state.cfg.tablet_vault)
             tab_count = len([k for k in raw if not state.cfg.is_ignored(k)])
         except Exception:
-            tab_count = -1  # error
+            tab_count = -1
 
-    # Determine sync status by running a dry comparison
+    # Use cached lightweight scans (no MD5) for status comparison
     sync_state = SyncState(Path(STATE_PATH_TEMPLATE.format(vault=state.vault)))
     has_state = sync_state.load()
 
     sync_status = "unknown"
     if tab_available and has_state:
-        pc_files = state.sync_engine._scan_pc()
-        tablet_files = state.sync_engine._scan_tablet()
+        pc_files = _cached_scan_pc()
+        tablet_files = _cached_scan_tablet()
         actions = state.sync_engine._compare(pc_files, tablet_files, sync_state, has_state)
         conflicts = sum(1 for a in actions if a.kind == "conflict")
         if conflicts > 0:
@@ -200,11 +290,11 @@ def api_status():
 def api_files():
     filter_type = request.args.get("filter", "all")
 
-    pc_files = state.sync_engine._scan_pc()
+    pc_files = _cached_scan_pc()
     tablet_files = {}
     if _device_available():
         try:
-            tablet_files = state.sync_engine._scan_tablet()
+            tablet_files = _cached_scan_tablet()
         except Exception:
             pass
 
@@ -244,26 +334,199 @@ def api_files():
 
 # ── API: Sync ─────────────────────────────────────────────────────────────────
 
-@app.route("/api/sync", methods=["POST"])
-def api_sync():
-    dry_run = request.args.get("dry_run") == "1"
-    job_id = logger.start(dry_run=dry_run)
+def _run_sync_in_thread(job_id, dry_run, filter_paths, was_staged):
+    """Execute sync in a background thread, updating _sync_jobs as it progresses.
 
-    # Capture all print() output from the sync engine so we can show it in the UI
+    Uses prepare() → check deletes → (maybe wait for confirm) → execute() flow.
+    """
+    global _staged_files
     buf = io.StringIO()
+
+    def _finish(ok, output, **extra):
+        logger.write(output)
+        logger.finish(ok)
+        _clear_scan_cache()
+        if was_staged and not dry_run:
+            _staged_files.clear()
+        with _sync_lock:
+            _sync_jobs[job_id] = {
+                "ok": ok, "job_id": job_id, "output": output,
+                "staged_cleared": was_staged and not dry_run,
+                "status": "done", **extra,
+            }
+
     try:
         with contextlib.redirect_stdout(buf):
-            success = state.sync_engine.sync(dry_run=dry_run)
-        output = buf.getvalue()
-        logger.write(output)
-        logger.finish(success)
-        return jsonify({"ok": success, "job_id": job_id, "output": output})
+            # Step 1: prepare — scan + compare
+            result = state.sync_engine.prepare(paths=filter_paths)
+        if result is None:
+            return _finish(False, buf.getvalue(), error="Prepare failed")
+
+        actions, _pc, _tab, _st = result
+
+        # Step 2: check for delete actions that need confirmation
+        del_pc = [a for a in actions if a.kind == "delete_pc"]
+        del_tab = [a for a in actions if a.kind == "delete_tablet"]
+        all_dels = del_pc + del_tab
+
+        if all_dels and not dry_run:
+            # Pause and ask user to confirm
+            del_info = []
+            for a in del_pc:
+                del_info.append({"path": a.path, "side": "pc", "reason": a.reason})
+            for a in del_tab:
+                del_info.append({"path": a.path, "side": "tablet", "reason": a.reason})
+
+            confirm_event = threading.Event()
+            confirm_decision = {"proceed": False, "push_instead": False}
+
+            with _sync_lock:
+                _sync_jobs[job_id] = {
+                    "status": "confirm_delete",
+                    "job_id": job_id,
+                    "output": buf.getvalue(),
+                    "deletes": del_info,
+                    "_event": confirm_event,
+                    "_decision": confirm_decision,
+                }
+
+            # Wait for user confirmation (max 5 minutes)
+            confirmed = confirm_event.wait(timeout=300)
+
+            if confirmed and confirm_decision["proceed"]:
+                # User confirmed — execute all actions including deletes
+                pass  # actions unchanged
+            elif confirmed and confirm_decision["push_instead"]:
+                # Convert delete_pc → push (re-push files to tablet)
+                restored = 0
+                for a in actions:
+                    if a.kind == "delete_pc":
+                        a.kind = "push"
+                        a.reason = "re-push to tablet"
+                        restored += 1
+                actions = [a for a in actions if a.kind != "delete_tablet"]
+                buf.write(f"\nℹ 已将 {restored} 个删除操作转为推送，文件将重新同步到平板。\n")
+            else:
+                # User skipped or timed out — remove delete actions
+                actions = [a for a in actions if a.kind not in ("delete_pc", "delete_tablet")]
+                if not confirmed:
+                    buf.write("\n⚠ 删除确认超时，已跳过删除操作。\n")
+                else:
+                    buf.write(f"\nℹ 已跳过 {len(all_dels)} 个删除操作。\n")
+
+        elif all_dels and dry_run:
+            buf.write(f"\n⚠ 预览: 检测到 {len(all_dels)} 个删除操作，正式同步时需确认。\n")
+
+        if not actions:
+            buf.write("\n没有需要执行的操作。\n")
+            return _finish(True, buf.getvalue())
+
+        # Step 3: execute
+        with contextlib.redirect_stdout(buf):
+            state.sync_engine.execute(actions, dry_run=dry_run)
+
+        return _finish(True, buf.getvalue())
+
     except Exception as e:
         err_output = buf.getvalue()
+        log_error(f"Sync job {job_id} failed: {e}", exc_info=__import__("sys").exc_info())
+        with _sync_lock:
+            _sync_jobs[job_id] = {
+                "ok": False, "error": str(e), "job_id": job_id,
+                "output": err_output, "status": "error",
+            }
         logger.write(err_output)
         logger.write(f"\n[ERROR] {e}\n")
         logger.finish(False)
-        return jsonify({"ok": False, "error": str(e), "job_id": job_id}), 500
+
+
+@app.route("/api/sync/confirm/<job_id>", methods=["POST"])
+def api_sync_confirm(job_id):
+    """User confirms, rejects, or re-pushes pending delete operations."""
+    data = request.get_json(silent=True) or {}
+    action = data.get("action", "skip")  # "proceed" | "skip" | "push_instead"
+
+    with _sync_lock:
+        job = _sync_jobs.get(job_id)
+
+    if job is None or job.get("status") != "confirm_delete":
+        return jsonify({"ok": False, "error": "No pending confirmation for this job"}), 400
+
+    event = job.get("_event")
+    decision = job.get("_decision")
+    if event is None or decision is None:
+        return jsonify({"ok": False, "error": "Job in unexpected state"}), 500
+
+    decision["proceed"] = (action == "proceed")
+    decision["push_instead"] = (action == "push_instead")
+    event.set()
+
+    with _sync_lock:
+        _sync_jobs[job_id]["status"] = "running"
+
+    return jsonify({"ok": True, "action": action})
+
+
+@app.route("/api/sync", methods=["POST"])
+def api_sync():
+    global _staged_files
+    dry_run = request.args.get("dry_run") == "1"
+    body = request.get_json(silent=True) or {}
+    paths = body.get("paths")
+    filter_paths = set(paths) if paths else None
+    is_staged = len(_staged_files) > 0
+
+    job_id = logger.start(dry_run=dry_run)
+
+    with _sync_lock:
+        _sync_jobs[job_id] = {"status": "running", "job_id": job_id}
+
+    # Spawn background thread — return immediately so the dashboard stays responsive
+    thread = threading.Thread(
+        target=_run_sync_in_thread,
+        args=(job_id, dry_run, filter_paths, is_staged),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({"ok": True, "job_id": job_id, "status": "started"})
+
+
+@app.route("/api/sync/status/<job_id>")
+def api_sync_status(job_id: str):
+    """Poll for sync progress. Returns job state including output when complete."""
+    with _sync_lock:
+        job = _sync_jobs.get(job_id)
+    if job is None:
+        return jsonify({"status": "unknown", "error": "Job not found"}), 404
+    # Strip internal objects that can't be JSON serialized
+    safe = {k: v for k, v in job.items() if not k.startswith("_")}
+    return jsonify(safe)
+
+
+# ── API: Staging ──────────────────────────────────────────────────────────────
+
+@app.route("/api/staged", methods=["GET", "POST", "DELETE"])
+def api_staged():
+    global _staged_files
+
+    if request.method == "GET":
+        return jsonify({"files": sorted(_staged_files), "count": len(_staged_files)})
+
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        paths = data.get("paths", [])
+        _staged_files.update(paths)
+        return jsonify({"ok": True, "count": len(_staged_files)})
+
+    # DELETE
+    data = request.get_json(silent=True) or {}
+    paths = data.get("paths")
+    if paths:
+        _staged_files.difference_update(paths)
+    else:
+        _staged_files.clear()
+    return jsonify({"ok": True, "count": len(_staged_files)})
 
 
 # ── API: Logs ─────────────────────────────────────────────────────────────────
@@ -447,50 +710,76 @@ def api_health():
     if not state.vault.is_dir():
         return jsonify({"error": "Vault not found"}), 404
 
-    issues = []
+    # Health check is expensive (reads every .md file). Cache aggressively.
+    cache_key = "health"
+    now = datetime.now().timestamp()
+    if cache_key in _scan_cache:
+        ts, data = _scan_cache[cache_key]
+        if now - ts < 60.0:  # 1 minute cache
+            return jsonify(data)
 
-    # 1. Find orphaned attachments (non-md files not referenced by any md)
+    issues = []
     md_files: list[Path] = []
     all_refs: set[str] = set()
     non_md_files: list[Path] = []
+    large_files: list[dict] = []
 
+    # Single pass: classify all files, collect large files
     for f in state.vault.rglob("*"):
         if not f.is_file():
             continue
         rel = str(f.relative_to(state.vault))
         if ".git/" in rel or ".syncstate.json" in rel:
             continue
+
+        size = f.stat().st_size
+        if size > 5 * 1024 * 1024 and ".git/" not in rel:
+            large_files.append({"path": rel.replace("\\", "/"), "size": size})
+
         if f.suffix.lower() == ".md":
             md_files.append(f)
-            try:
-                content = f.read_text(encoding="utf-8")
-                # Find wikilinks [[xxx]]
-                for m in re.finditer(r"\[\[([^\]|#]+)", content):
-                    all_refs.add(m.group(1).strip())
-                # Find markdown links [text](path)
-                for m in re.finditer(r"\]\(([^)]+)\)", content):
-                    ref = m.group(1).strip()
-                    if not ref.startswith("http"):
-                        all_refs.add(ref)
-                # Find embedded files ![[xxx]]
-                for m in re.finditer(r"!\[\[([^\]|#]+)", content):
-                    all_refs.add(m.group(1).strip())
-            except Exception:
-                pass
         else:
             non_md_files.append(f)
 
-    # Check which non-md files are orphaned
-    md_names = {f.stem for f in md_files}
-    md_paths = {str(f.relative_to(state.vault)).replace("\\", "/") for f in md_files}
-    # Also map stems to paths for loose matching
+    # Process .md files for wikilinks (file contents read once per file, released after)
+    md_names: set[str] = set()
+    md_paths: set[str] = set()
     stem_to_paths: dict[str, list[str]] = {}
+    broken_links: list[dict] = []
+
     for f in md_files:
-        stem = f.stem
         rel = str(f.relative_to(state.vault)).replace("\\", "/")
+        stem = f.stem
+        md_names.add(stem)
+        md_paths.add(rel)
         stem_to_paths.setdefault(stem, []).append(rel)
 
+        try:
+            content = f.read_text(encoding="utf-8")
+            for m in re.finditer(r"\[\[([^\]|#]+)", content):
+                target = m.group(1).strip()
+                all_refs.add(target)
+                target_clean = target.split("/")[-1] if "/" in target else target
+                found = (
+                    target in md_paths
+                    or target + ".md" in md_paths
+                    or target_clean in md_names
+                    or target_clean + ".md" in md_names
+                )
+                if not found:
+                    broken_links.append({"source": rel, "target": target})
+            for m in re.finditer(r"\]\(([^)]+)\)", content):
+                ref = m.group(1).strip()
+                if not ref.startswith("http"):
+                    all_refs.add(ref)
+            for m in re.finditer(r"!\[\[([^\]|#]+)", content):
+                all_refs.add(m.group(1).strip())
+        except Exception:
+            pass
+
+    # Check orphaned attachments
     orphans = []
+    md_paths_for_orphan = {str(f.relative_to(state.vault)).replace("\\", "/") for f in md_files}
     for f in non_md_files:
         rel = str(f.relative_to(state.vault)).replace("\\", "/")
         name = f.name
@@ -502,44 +791,17 @@ def api_health():
             or any(ref in rel for ref in all_refs)
         )
         if not is_referenced:
-            # Check if it's a common Obsidian config file
             if (not rel.startswith(".obsidian/") and not rel.startswith(".trash/")
                     and not rel.startswith(".git/") and rel != ".gitignore"):
-                orphans.append({
-                    "path": rel,
-                    "size": f.stat().st_size,
-                })
+                orphans.append({"path": rel, "size": f.stat().st_size})
 
     if orphans:
         issues.append({
             "type": "orphaned_attachments",
             "label": f"{len(orphans)} orphaned attachments",
             "severity": "warning",
-            "files": orphans[:20],  # cap at 20
+            "files": orphans[:20],
         })
-
-    # 2. Find broken wikilinks
-    broken_links: list[dict] = []
-    for f in md_files:
-        try:
-            content = f.read_text(encoding="utf-8")
-            for m in re.finditer(r"\[\[([^\]|#]+)", content):
-                target = m.group(1).strip()
-                # Check if target exists as a file
-                target_clean = target.split("/")[-1] if "/" in target else target
-                found = (
-                    target in md_paths
-                    or target + ".md" in md_paths
-                    or target_clean in md_names
-                    or target_clean + ".md" in md_names
-                )
-                if not found:
-                    broken_links.append({
-                        "source": str(f.relative_to(state.vault)).replace("\\", "/"),
-                        "target": target,
-                    })
-        except Exception:
-            pass
 
     if broken_links:
         issues.append({
@@ -549,17 +811,6 @@ def api_health():
             "links": broken_links[:20],
         })
 
-    # 3. Large files (>5MB)
-    large_files = []
-    for f in state.vault.rglob("*"):
-        if not f.is_file():
-            continue
-        size = f.stat().st_size
-        if size > 5 * 1024 * 1024:
-            rel = str(f.relative_to(state.vault)).replace("\\", "/")
-            if ".git/" not in rel:
-                large_files.append({"path": rel, "size": size})
-
     if large_files:
         issues.append({
             "type": "large_files",
@@ -568,10 +819,31 @@ def api_health():
             "files": large_files,
         })
 
-    return jsonify({
+    result = {
         "healthy": len([i for i in issues if i["severity"] == "error"]) == 0,
         "issues": issues,
-    })
+    }
+    _scan_cache[cache_key] = (now, result)
+    return jsonify(result)
+
+
+# ── API: Error Log ─────────────────────────────────────────────────────────────
+
+@app.route("/api/errors")
+def api_errors():
+    """Return recent error log entries from .sync_errors.log."""
+    limit = int(request.args.get("limit", 30))
+    try:
+        if not ERROR_LOG_PATH.exists():
+            return jsonify({"errors": [], "count": 0})
+        with open(ERROR_LOG_PATH, encoding="utf-8") as f:
+            raw = f.read()
+        # Parse entries: split by "---" separator
+        entries = [e.strip() for e in raw.split("-" * 60) if e.strip()]
+        entries = entries[-limit:]  # most recent last
+        return jsonify({"errors": entries, "count": len(entries), "total": len(entries)})
+    except OSError as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── API: Config ───────────────────────────────────────────────────────────────
@@ -591,6 +863,7 @@ def api_config():
         # Switch vault, reload all state
         old_vault = str(state.vault)
         state.reload(new_path)
+        _clear_scan_cache()
 
         # Initialize the new vault
         p.mkdir(parents=True, exist_ok=True)

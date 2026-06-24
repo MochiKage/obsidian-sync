@@ -12,6 +12,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import traceback
 
 # Windows 中文版默认用 GBK 编码输出，但脚本内使用 emoji 字符（⬆⬇⚡ 等），
 # GBK 无法编码这些字符会导致 UnicodeEncodeError。强制切换到 UTF-8。
@@ -21,6 +23,32 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# ── Global Error Logger ────────────────────────────────────────────────────────
+
+ERROR_LOG_PATH = Path(__file__).resolve().parent / ".sync_errors.log"
+_error_log_lock = threading.Lock()
+
+
+def log_error(message, exc_info=None):
+    """Append an error entry to .sync_errors.log with timestamp and traceback."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{ts}] {message}\n"
+    if exc_info:
+        entry += "".join(traceback.format_exception(*exc_info)) + "\n"
+    else:
+        entry += f"  (no traceback)\n"
+    entry += "-" * 60 + "\n"
+
+    with _error_log_lock:
+        try:
+            with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(entry)
+        except OSError:
+            pass
+
+    # Also print to stderr
+    print(entry, file=sys.stderr, end="")
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -89,6 +117,10 @@ class Config:
 
     @property
     def adb_path(self) -> str:
+        """Return ADB executable path, auto-detecting if not set in config.
+
+        Priority: explicit config value → ADB_CANDIDATES probe → PATH fallback.
+        """
         val = self._data.get("adb_path", "auto")
         if val and val != "auto":
             return val
@@ -138,24 +170,40 @@ class ADB:
     def __init__(self, adb_path: str):
         self._adb = adb_path
 
-    def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    def _run(self, *args: str, check: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
         """执行 adb 命令，统一处理编码。
 
         必须指定 encoding='utf-8'：Windows 中文版 subprocess 默认用 GBK 解码，
         而 adb 输出（尤其是平板上的中文文件名）是 UTF-8，不指定会 UnicodeDecodeError。
-        """
-        return subprocess.run(
-            [self._adb] + list(args),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=check,
-        )
 
-    def check_device(self) -> bool:
-        """Return True if exactly one authorized device is connected."""
-        r = self._run("devices", check=False)
+        timeout 默认 30 秒，防止 ADB 命令无限卡死阻塞整个同步流程。
+        """
+        try:
+            return subprocess.run(
+                [self._adb] + list(args),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=check,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            # Return a failed-like result instead of crashing
+            return subprocess.CompletedProcess(
+                args=[self._adb] + list(args),
+                returncode=-1,
+                stdout="",
+                stderr=f"ADB command timed out after {timeout}s",
+            )
+
+    def check_device(self, fast: bool = False) -> bool:
+        """Return True if at least one authorized device is connected.
+
+        fast=True: use a short timeout (5s) to quickly detect disconnection.
+        """
+        timeout = 5 if fast else 30
+        r = self._run("devices", check=False, timeout=timeout)
         lines = r.stdout.strip().splitlines()
         devices = [l for l in lines[1:] if l.strip() and "\tdevice" in l]
         return len(devices) >= 1
@@ -163,34 +211,37 @@ class ADB:
     def get_files(self, vault_path: str) -> dict[str, FileInfo]:
         """扫描平板 vault，返回 {相对路径: FileInfo}。
 
-        用 find + stat 一次拿到所有文件的 mtime，再逐个 md5sum 取哈希。
-        哈希计算是 O(n) 次 adb shell 调用，大 vault 可能慢，但对于笔记量级足够了。
+        用 find + sh -c 一次拿到所有文件的 mtime 和 md5，只需 1 次 adb shell 调用。
+        原来逐个 md5sum 需要 N+1 次 ADB 往返，这是最大的延迟来源。
         """
-        # find 遍历所有文件，stat -c '%Y\t%n' 输出「Unix时间戳\t相对路径」
-        cmd = (
-            f"cd '{vault_path}' 2>/dev/null && "
-            f"find . -type f -exec stat -c '%Y\t%n' {{}} \\; 2>/dev/null || true"
-        )
-        r = self._run("shell", cmd)
+        # 单个 adb 命令：find 列出文件，while read 逐行处理 stat + md5sum
+        # 输出格式：mtime\thash\trelpath
+        # 这样只需 1 次 adb shell 调用，而非原来的 N+1 次
+        shell_cmd = (
+            "cd '%s' 2>/dev/null && "
+            "find . -type f 2>/dev/null | while IFS= read -r f; do "
+            "rel=\"${f#./}\"; "
+            "mtime=$(stat -c %%Y \"$f\" 2>/dev/null || echo 0); "
+            "hash=$(md5sum \"$f\" 2>/dev/null | { read h _; echo ${h:- };}); "
+            "printf \"%%s\\t%%s\\t%%s\\n\" \"$mtime\" \"${hash:- }\" \"$rel\"; "
+            "done || true"
+        ) % vault_path
+        r = self._run("shell", shell_cmd, timeout=120)
         result: dict[str, FileInfo] = {}
         for line in r.stdout.strip().splitlines():
             if not line.strip():
                 continue
-            try:
-                mtime_str, rel_path = line.split("\t", 1)
-                mtime = float(mtime_str)
-            except ValueError:
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
                 continue
-            # removeprefix 而非 lstrip：lstrip("./") 会把 .obsidian 的 . 也吃掉
-            rel_path = rel_path.removeprefix("./").replace("\\", "/")
+            try:
+                mtime = float(parts[0])
+            except ValueError:
+                mtime = 0.0
+            file_hash = parts[1].strip() or "-"
+            rel_path = parts[2].replace("\\", "/")
             if not rel_path:
                 continue
-            file_path = f"{vault_path}/{rel_path}"
-            try:
-                hr = self._run("shell", f"md5sum '{file_path}' 2>/dev/null || true")
-                file_hash = hr.stdout.strip().split()[0] if hr.stdout.strip() else "-"
-            except Exception:
-                file_hash = "-"
             result[rel_path] = FileInfo(rel_path=rel_path, mtime=mtime, hash=file_hash)
         return result
 
@@ -228,29 +279,55 @@ class SyncState:
         self.files: dict[str, dict] = {}  # rel_path -> {pc_mtime, pc_hash, tablet_mtime, tablet_hash}
 
     def load(self) -> bool:
-        """Load state from disk. Returns False if no previous state."""
+        """Load state from disk. Returns False if no previous state.
+
+        If .syncstate.json is corrupted (e.g., process killed mid-write on old
+        non-atomic save), tries to recover from .syncstate.tmp.
+        """
         if not self._path.exists():
             return False
-        try:
-            with open(self._path, encoding="utf-8") as f:
-                data = json.load(f)
-            self.last_sync = data.get("last_sync", "")
-            self.files = data.get("files", {})
+
+        def _try_load(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                self.last_sync = data.get("last_sync", "")
+                self.files = data.get("files", {})
+                return True
+            except (json.JSONDecodeError, KeyError, OSError):
+                return False
+
+        if _try_load(self._path):
             return True
-        except (json.JSONDecodeError, KeyError):
-            return False
+
+        # Main file corrupted — try recover from tmp
+        tmp_path = self._path.with_suffix(".tmp")
+        if tmp_path.exists():
+            print(f"Warning: {self._path.name} was corrupted. Recovering from .tmp backup.")
+            if _try_load(tmp_path):
+                # Restore the main file
+                self.save()
+                return True
+
+        return False
 
     def save(self):
-        """Write state to disk."""
+        """Write state to disk atomically.
+
+        先写临时文件，成功后再 rename。这样即使写入中途进程被杀，
+        .syncstate.json 也不会处于半写崩坏状态。
+        """
         self.last_sync = datetime.now(timezone.utc).isoformat()
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as f:
+        tmp_path = self._path.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(
                 {"last_sync": self.last_sync, "files": self.files},
                 f,
                 indent=2,
                 ensure_ascii=False,
             )
+        tmp_path.replace(self._path)  # atomic rename on same filesystem
 
     def update_entry(self, rel_path: str, pc_info: Optional[FileInfo], tablet_info: Optional[FileInfo]):
         """Record the current state of a file from both sides."""
@@ -342,11 +419,12 @@ class ObsidianSync:
 
     # ── Scanning ──────────────────────────────────────────────────────────
 
-    def _scan_pc(self) -> dict[str, FileInfo]:
+    def _scan_pc(self, compute_hash: bool = True) -> dict[str, FileInfo]:
         """遍历 PC vault，返回所有非忽略文件的快照。
 
-        对每个文件计算 MD5 哈希——用于冲突检测中区分「mtime 变了但内容没变」
-        （例如 git checkout 可能修改 mtime 但内容不变）。
+        compute_hash=True（默认）：对每个文件计算 MD5，用于冲突检测。
+        compute_hash=False：跳过哈希，仅记录 mtime，大幅降低内存和磁盘 I/O。
+        面板状态查询应使用 compute_hash=False，只有实际执行 sync 时才需要哈希。
         """
         files: dict[str, FileInfo] = {}
         vault = self._cfg.pc_vault
@@ -360,10 +438,14 @@ class ObsidianSync:
                 continue
             if ".syncstate.json" in rel:
                 continue
+            if ".git/" in rel:
+                continue
             try:
                 st = entry.stat()
-                content = entry.read_bytes()
-                fhash = hashlib.md5(content).hexdigest()
+                if compute_hash:
+                    fhash = hashlib.md5(entry.read_bytes()).hexdigest()
+                else:
+                    fhash = str(int(st.st_mtime))  # placeholder, not used for comparison
             except OSError:
                 continue
             files[rel] = FileInfo(rel_path=rel, mtime=st.st_mtime, hash=fhash)
@@ -421,6 +503,7 @@ class ObsidianSync:
             pc_info = pc.get(key)
             tab_info = tablet.get(key)
 
+            # ── 场景1：两边都有 ──
             if in_pc and in_tab:
                 if not in_state:
                     # 首次同步前两边独立创建了同名文件 → 冲突
@@ -443,6 +526,7 @@ class ObsidianSync:
                 elif tab_changed:
                     actions.append(Action("pull", key, "tablet modified"))
 
+            # ── 场景2：仅 PC 有 ──
             elif in_pc and not in_tab:
                 if in_state and state.tablet_mtime(key) is not None:
                     pc_changed = (
@@ -456,6 +540,7 @@ class ObsidianSync:
                 else:
                     actions.append(Action("push", key, "new on pc"))
 
+            # ── 场景3：仅平板有 ──
             elif not in_pc and in_tab:
                 if in_state and state.pc_mtime(key) is not None:
                     tab_changed = (
@@ -471,32 +556,106 @@ class ObsidianSync:
 
             # 都不存在：曾同步过的文件被两边都删了 → 静默从状态中移除
 
+        # ── 安全阀：区分「用户主动删除」和「扫描不完整」 ──
+        # 原理：如果平板剩余文件的 mtime 与基线匹配，说明扫描准确、缺失即真删除；
+        # 如果连剩余文件都对不上基线，说明扫描有问题（目录错误/连接中断），阻止删除。
+        DEL_SAFETY_MIN_MATCH_RATE = 0.7   # 剩余文件 mtime 匹配率低于此值 → 阻止
+        DEL_SAFETY_MIN_COUNT = 5           # 删除数少于此 → 不触发检查（日常删几个无需验证）
+
+        del_pc_actions = [a for a in actions if a.kind == "delete_pc"]
+        del_tab_actions = [a for a in actions if a.kind == "delete_tablet"]
+
+        if del_pc_actions and len(del_pc_actions) >= DEL_SAFETY_MIN_COUNT and has_prev_state:
+            # 统计：平板当前存在的文件中，有多少 mtime 与基线一致
+            matched = 0
+            total_on_tablet = 0
+            for key, tab_info in tablet.items():
+                entry = state.files.get(key)
+                if entry and entry.get("tablet_mtime") is not None:
+                    total_on_tablet += 1
+                    if abs(tab_info.mtime - entry["tablet_mtime"]) < 1.0:
+                        matched += 1
+
+            if total_on_tablet > 0:
+                match_rate = matched / total_on_tablet
+                if match_rate < DEL_SAFETY_MIN_MATCH_RATE:
+                    # 剩余文件的 mtime 大面积不匹配 → 扫描可能有问题
+                    names = ", ".join(a.path for a in del_pc_actions[:5])
+                    if len(del_pc_actions) > 5:
+                        names += f" ... 及其他 {len(del_pc_actions) - 5} 个文件"
+                    print(
+                        f"  ⚠ 安全阀触发：{len(del_pc_actions)} 个文件将被删除，"
+                        f"但平板剩余文件 mtime 匹配率仅 {match_rate:.0%} "
+                        f"（{matched}/{total_on_tablet}），可能是扫描不完整。已跳过删除。"
+                    )
+                    print(f"     跳过：{names}")
+                    actions = [a for a in actions if a.kind != "delete_pc"]
+                else:
+                    # mtime 匹配率高 → 扫描准确，缺失是真删除
+                    print(
+                        f"  ℹ 平板剩余文件 mtime 匹配率 {match_rate:.0%}，"
+                        f"确认 {len(del_pc_actions)} 个文件已被手动删除，将同步到 PC。"
+                    )
+
+        if del_tab_actions and len(del_tab_actions) >= DEL_SAFETY_MIN_COUNT and has_prev_state:
+            matched = 0
+            total_on_pc = 0
+            for key, pc_info in pc.items():
+                entry = state.files.get(key)
+                if entry and entry.get("pc_mtime") is not None:
+                    total_on_pc += 1
+                    if abs(pc_info.mtime - entry["pc_mtime"]) < 1.0:
+                        matched += 1
+
+            if total_on_pc > 0:
+                match_rate = matched / total_on_pc
+                if match_rate < DEL_SAFETY_MIN_MATCH_RATE:
+                    print(f"  ⚠ 安全阀触发：跳过 {len(del_tab_actions)} 个平板端删除操作 "
+                          f"（PC mtime 匹配率仅 {match_rate:.0%}）")
+                    actions = [a for a in actions if a.kind != "delete_tablet"]
+                else:
+                    print(f"  ℹ PC 剩余文件 mtime 匹配率 {match_rate:.0%}，"
+                          f"确认 {len(del_tab_actions)} 个文件已被手动删除，将同步到平板。")
+
         return actions
 
     # ── Execution ─────────────────────────────────────────────────────────
 
     def _execute(self, actions: list[Action]) -> tuple[int, int, int, int, int]:
-        """Run actions. Returns (pushed, pulled, conflicts, deleted_pc, deleted_tablet)."""
+        """Run actions. Returns (pushed, pulled, conflicts, deleted_pc, deleted_tablet).
+
+        If consecutive ADB failures are detected (USB disconnect), remaining ADB
+        operations are skipped to avoid piling up timeouts.
+        """
         pushed = pulled = conflicts = del_pc = del_tab = 0
+        adb_failures = 0  # consecutive ADB operation failures
 
         for act in actions:
+            # After 2 consecutive ADB failures, assume device is gone
+            if adb_failures >= 2:
+                if act.kind in ("push", "pull", "conflict", "delete_tablet"):
+                    print(f"  ⊘ SKIP {act.kind.upper()} {act.path} (device disconnected)")
+                    continue
+
             pc_file = self._cfg.pc_vault / act.path
             tablet_file = f"{self._cfg.tablet_vault}/{act.path}"
 
             if act.kind == "push":
                 ok = self._adb.push(pc_file, tablet_file)
                 if ok:
-                    pushed += 1
+                    pushed += 1; adb_failures = 0
                     print(f"  ⬆  PUSH  {act.path}")
                 else:
+                    adb_failures += 1
                     print(f"  ✗ FAIL PUSH {act.path}")
 
             elif act.kind == "pull":
                 ok = self._adb.pull(tablet_file, pc_file)
                 if ok:
-                    pulled += 1
+                    pulled += 1; adb_failures = 0
                     print(f"  ⬇  PULL  {act.path}")
                 else:
+                    adb_failures += 1
                     print(f"  ✗ FAIL PULL {act.path}")
 
             elif act.kind == "conflict":
@@ -521,111 +680,124 @@ class ObsidianSync:
             elif act.kind == "delete_tablet":
                 ok = self._adb.delete(tablet_file)
                 if ok:
-                    del_tab += 1
+                    del_tab += 1; adb_failures = 0
                     print(f"  ✕ DEL TAB {act.path}")
                 else:
+                    adb_failures += 1
                     print(f"  ✗ FAIL DEL TAB {act.path}")
 
         return pushed, pulled, conflicts, del_pc, del_tab
 
     # ── Main Flow ─────────────────────────────────────────────────────────
 
-    def sync(self, dry_run: bool = False) -> bool:
-        """执行一次完整同步周期。
+    def prepare(self, paths: set[str] | None = None) -> tuple[list[Action], dict, dict, bool] | None:
+        """扫描 + 比对，返回 (actions, pc_files, tablet_files, has_state) 或 None（错误）。
 
-        生命周期：前置快照 → 扫描 → 比对 → 执行 → 重新扫描 → 后置提交 → 保存状态
-
-        前置快照（pre-sync commit）确保即使同步过程中出错，当前 PC 状态已被保存。
-        后置重新扫描是必需的：adb pull/push 后文件 mtime 会变，必须用新值更新状态，
-        否则下次同步会误判为「两边都变了」。
+        将 sync 拆为 prepare/execute 两步，让调用方可以在执行前介入确认删除等操作。
         """
-        # 1. 检查 ADB 连接
+        # 1-4. 前置检查
         if not self._adb.check_device():
             print("Error: No ADB device connected. Check USB cable and USB debugging.")
-            return False
-
-        # 2. 检查 PC vault 存在
+            log_error("No ADB device connected")
+            return None
         vault = self._cfg.pc_vault
         if not vault.is_dir():
             print(f"Error: PC vault not found at '{vault}'")
-            return False
-
-        # 3. 检查 Git 仓库
+            log_error(f"PC vault not found: {vault}")
+            return None
         if not self._git.is_repo():
             print(f"Warning: '{vault}' is not a git repo. Run --init first.")
-            return False
+            log_error(f"Not a git repo: {vault}")
+            return None
 
-        # 4. 加载上次同步状态
         has_state = self._state.load()
 
-        # 5. 前置快照：保存当前 PC 状态到 Git
-        if not dry_run and self._git.has_changes():
+        # 5. 前置快照
+        if self._git.has_changes():
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._git.commit(f"pre-sync snapshot: {ts}")
             print(f"📸 Pre-sync snapshot committed")
 
-        # 6. 扫描两边
+        # 6. 扫描（先快速复检 ADB，断开则立即失败不浪费时间）
         print("Scanning...")
+        if not self._adb.check_device(fast=True):
+            print("Error: ADB device disconnected before scan.")
+            log_error("ADB device disconnected before scan")
+            return None
         pc_files = self._scan_pc()
         tablet_files = self._scan_tablet()
         print(f"  PC:      {len(pc_files)} files")
         print(f"  Tablet:  {len(tablet_files)} files")
 
-        # 7. 三向比对
+        # 7. 比对
         actions = self._compare(pc_files, tablet_files, self._state, has_state)
+        if paths is not None:
+            actions = [a for a in actions if a.path in paths]
 
         if not actions:
             print("Already in sync.")
-            pc_files = self._scan_pc()
-            tablet_files = self._scan_tablet()
-            self._save_post_state(pc_files, tablet_files)
-            return True
+            self._save_post_state(
+                self._scan_pc(), self._scan_tablet()
+            )
+            return [], pc_files, tablet_files, has_state
 
-        # 8. 展示操作计划
+        # 8. 展示计划
         counts = {"push": 0, "pull": 0, "conflict": 0, "delete_pc": 0, "delete_tablet": 0}
         for a in actions:
             counts[a.kind] += 1
         print(f"\nChanges detected:")
-        if counts["push"]:
-            print(f"  ⬆  Push:    {counts['push']}")
-        if counts["pull"]:
-            print(f"  ⬇  Pull:    {counts['pull']}")
-        if counts["conflict"]:
-            print(f"  ⚡ Conflict: {counts['conflict']}")
-        if counts["delete_pc"]:
-            print(f"  ✕  Del PC:   {counts['delete_pc']}")
-        if counts["delete_tablet"]:
-            print(f"  ✕  Del Tab:  {counts['delete_tablet']}")
+        if counts["push"]:    print(f"  ⬆  Push:    {counts['push']}")
+        if counts["pull"]:    print(f"  ⬇  Pull:    {counts['pull']}")
+        if counts["conflict"]: print(f"  ⚡ Conflict: {counts['conflict']}")
+        if counts["delete_pc"]: print(f"  ✕  Del PC:   {counts['delete_pc']}")
+        if counts["delete_tablet"]: print(f"  ✕  Del Tab:  {counts['delete_tablet']}")
 
+        return actions, pc_files, tablet_files, has_state
+
+    def execute(self, actions: list[Action], dry_run: bool = False):
+        """执行给定的 action 列表并完成状态保存和提交。"""
         if dry_run:
             print("\n[Dry run — no changes made]")
-            return True
+            return 0, 0, 0, 0, 0
 
-        # 9. 执行操作
+        # 快速复检 ADB，断开则立即失败
+        if not self._adb.check_device(fast=True):
+            print("Error: ADB device disconnected before executing sync actions.")
+            log_error("ADB device disconnected before executing")
+            return 0, 0, 0, 0, 0
+
         print()
         pushed, pulled, conflicts, del_pc, del_tab = self._execute(actions)
 
-        # 10. 关键：重新扫描两边再保存状态
-        # adb pull/push 之后文件的 mtime 是操作完成的时间，不是原始修改时间。
-        # 必须用执行后的 mtime 建立新基线，否则下次同步会误判变更。
+        # 重新扫描 + 保存状态
         pc_files = self._scan_pc()
         tablet_files = self._scan_tablet()
         self._save_post_state(pc_files, tablet_files)
 
-        # 11. 后置提交：记录本次同步变更
+        # 后置提交
         parts = []
-        if pulled:
-            parts.append(f"pulled {pulled}")
-        if pushed:
-            parts.append(f"pushed {pushed}")
-        if conflicts:
-            parts.append(f"{conflicts} conflicts")
+        if pulled:    parts.append(f"pulled {pulled}")
+        if pushed:    parts.append(f"pushed {pushed}")
+        if conflicts: parts.append(f"{conflicts} conflicts")
+        if del_pc:    parts.append(f"del-pc {del_pc}")
+        if del_tab:   parts.append(f"del-tab {del_tab}")
         msg = "sync: " + ", ".join(parts) if parts else "sync: no changes"
         if self._git.has_changes():
             self._git.commit(msg)
             print(f"\n📝 Git: {msg}")
 
         print("\n✔ Sync complete.")
+        return pushed, pulled, conflicts, del_pc, del_tab
+
+    def sync(self, dry_run: bool = False, paths: set[str] | None = None) -> bool:
+        """CLI 便捷方法：prepare + execute 一气呵成（不暂停确认删除）。"""
+        result = self.prepare(paths=paths)
+        if result is None:
+            return False
+        actions, _pc, _tab, _st = result
+        if not actions:
+            return True
+        self.execute(actions, dry_run=dry_run)
         return True
 
     def _save_post_state(self, pc: dict[str, FileInfo], tablet: dict[str, FileInfo]):

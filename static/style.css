@@ -176,7 +176,7 @@ button {
 .scroll-list::-webkit-scrollbar { width: 6px; }
 .scroll-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
-/* ── File List ────────────────────────────────────────────────────── */
+/* ── File List (Tree) ───────────────────────────────────────────────── */
 #filter-select {
   background: var(--bg);
   color: var(--text);
@@ -187,38 +187,93 @@ button {
   font-family: var(--font);
 }
 
-.file-item {
+/* Directory aggregate status colors */
+.file-dir-conflict .tree-icon { color: var(--red); }
+.file-dir-pending .tree-icon { color: var(--yellow); }
+
+/* File row — used for both dirs and files */
+.file-tree-file {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 14px;
+  gap: 6px;
+  padding: 5px 12px 5px 0;
   cursor: pointer;
-  border-bottom: 1px solid rgba(255,255,255,.03);
+  font-size: 13px;
+  border-bottom: 1px solid rgba(255,255,255,.02);
   transition: background .1s;
 }
 
-.file-item:hover { background: var(--bg-hover); }
-.file-item.active { background: var(--bg-active); }
+.file-tree-file:hover { background: var(--bg-hover); }
+.file-tree-file.active { background: var(--bg-active); }
 
-.file-status {
-  font-size: 14px;
-  width: 20px;
-  text-align: center;
+/* File status colors via .tree-icon */
+.status-push  .tree-icon { color: var(--blue); }
+.status-pull  .tree-icon { color: var(--green); }
+.status-conflict .tree-icon { color: var(--red); font-weight: bold; }
+.status-synced .tree-icon { color: var(--text-dim); }
+
+/* Panel split: vault files + staging */
+#panel-files { display: flex; flex-direction: column; }
+#panel-files > .panel-header { flex-shrink: 0; }
+
+.file-section {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.file-section:first-of-type { flex: 1; min-height: 0; }
+#staging-section {
+  flex: 0 0 auto;
+  max-height: 45%;
+  border-top: 2px solid var(--border);
+}
+
+/* Stage action bar */
+.stage-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
   flex-shrink: 0;
 }
-
-.file-path {
+.stage-bar .check-all {
   flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 13px;
+  cursor: pointer;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  user-select: none;
 }
 
-.status-push  .file-status { color: var(--blue); }
-.status-pull  .file-status { color: var(--green); }
-.status-conflict .file-status { color: var(--red); font-weight: bold; }
-.status-synced .file-status { color: var(--text-dim); }
+/* Staging header */
+.stage-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  flex-shrink: 0;
+}
+#staging-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+
+/* Checkbox in file tree */
+.tree-check {
+  width: 14px; min-width: 14px; height: 14px;
+  cursor: pointer;
+  accent-color: var(--accent);
+  margin: 0 2px;
+}
+
+/* Staging scroll area tighten */
+#staging-list { min-height: 40px; }
+#staging-list .placeholder { height: 60px; }
 
 /* ── History List ─────────────────────────────────────────────────── */
 #btn-search {
@@ -452,22 +507,53 @@ button {
   border-radius: 6px;
 }
 
-.browse-entry {
+/* ── Tree View (Folder Browser) ──────────────────────────────────────── */
+.tree-node { }
+
+.tree-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
+  gap: 6px;
+  padding: 6px 12px 6px 0;
   cursor: pointer;
   font-size: 13px;
-  border-bottom: 1px solid rgba(255,255,255,.03);
+  border-bottom: 1px solid rgba(255,255,255,.02);
   transition: background .1s;
+  user-select: none;
 }
 
-.browse-entry:hover { background: var(--bg-hover); }
-.browse-entry.selected { background: var(--bg-active); }
+.tree-row:hover { background: var(--bg-hover); }
+.tree-row.selected { background: var(--bg-active); }
 
-.browse-entry .icon { font-size: 16px; width: 22px; text-align: center; }
-.browse-entry .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-arrow {
+  font-size: 10px;
+  width: 18px;
+  min-width: 18px;
+  text-align: center;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.tree-arrow:hover { color: var(--text); }
+
+.tree-icon {
+  font-size: 16px;
+  width: 22px;
+  min-width: 22px;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.tree-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tree-children { }
+
+.tree-children.hidden { display: none; }
 
 .browse-footer {
   display: flex;
@@ -567,3 +653,127 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ── Wide Modal (Pending / Health) ────────────────────────────────────── */
+.wide-box {
+  width: 620px;
+  max-height: 75vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Pending Changes Modal ────────────────────────────────────────────── */
+.pending-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.pending-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  font-size: 12px;
+  background: var(--bg);
+}
+
+.pending-chip strong {
+  color: var(--text);
+}
+
+.pending-list {
+  flex: 1;
+  overflow-y: auto;
+  max-height: 50vh;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.pending-group {
+  padding: 0;
+}
+
+.pending-group + .pending-group {
+  border-top: 1px solid var(--border);
+}
+
+.pending-group-header {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--bg-hover);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.pending-file {
+  display: flex;
+  align-items: center;
+  padding: 5px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid rgba(255,255,255,.02);
+  transition: background .1s;
+}
+
+.pending-file:hover { background: var(--bg-hover); }
+
+.pending-file:last-child { border-bottom: none; }
+
+.pending-file-dir {
+  color: var(--text-dim);
+  font-size: 11px;
+  margin-right: 2px;
+  white-space: nowrap;
+}
+
+.pending-file-name {
+  color: var(--text);
+}
+
+/* ── Health Detail Modal ──────────────────────────────────────────────── */
+.health-detail-content {
+  flex: 1;
+  overflow-y: auto;
+  max-height: 55vh;
+}
+
+.health-detail-section {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.health-detail-section:first-child { padding-top: 0; }
+
+.health-detail-section h4 {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.health-detail-files {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-top: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.health-detail-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  border-bottom: 1px solid rgba(255,255,255,.02);
+  transition: background .1s;
+}
+
+.health-detail-file:hover { background: var(--bg-hover); }
+
+.health-detail-file:last-child { border-bottom: none; }
