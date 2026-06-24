@@ -1,0 +1,14 @@
+{
+  "pc_vault_path": "D:/Sekai/obsidian-vault",
+  "tablet_vault_path": "/sdcard/Documents/Note",
+  "adb_path": "auto",
+  "conflict_strategy": "keep_both",
+  "delete_strategy": "propagate",
+  "ignore_patterns": [
+    ".obsidian/workspace*.json",
+    ".obsidian/app.json",
+    ".obsidian/appearance.json",
+    ".trash/",
+    ".DS_Store"
+  ]
+}
