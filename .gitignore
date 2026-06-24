@@ -1,3 +1,4 @@
 .syncstate.json
 __pycache__/
 *.pyc
+.opencode

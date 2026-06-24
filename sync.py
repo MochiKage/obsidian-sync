@@ -13,7 +13,8 @@ import os
 import subprocess
 import sys
 
-# Force UTF-8 output (Windows Chinese locale defaults to GBK)
+# Windows 中文版默认用 GBK 编码输出，但脚本内使用 emoji 字符（⬆⬇⚡ 等），
+# GBK 无法编码这些字符会导致 UnicodeEncodeError。强制切换到 UTF-8。
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from dataclasses import dataclass
@@ -27,9 +28,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 STATE_PATH_TEMPLATE = "{vault}/.syncstate.json"
 
-# Known ADB install paths in order of preference
+# ADB 路径自动检测，按优先级依次尝试：
+#   1. winget 安装的 Google PlatformTools（含具体版本目录）
+#   2. C:\platform-tools\（常见手动安装路径）
+#   3. Android SDK 默认路径
+#   4. 系统 PATH 中的 adb（兜底）
+# 每个候选是 lambda，只有前一个检测不到时才尝试下一个。
 ADB_CANDIDATES = [
-    # winget installation
     lambda: (
         Path(os.environ["LOCALAPPDATA"])
         / "Microsoft/WinGet/Packages"
@@ -47,6 +52,11 @@ ADB_CANDIDATES = [
 
 @dataclass
 class FileInfo:
+    """文件快照：记录路径、修改时间和 MD5 哈希。
+
+    mtime 来自 stat 的 st_mtime（Unix 时间戳），PC 和平板可跨平台直接比较。
+    hash 用于冲突检测的辅助判断——mtime 相同但 hash 不同 = 内容确实变了。
+    """
     rel_path: str
     mtime: float
     hash: str
@@ -54,6 +64,7 @@ class FileInfo:
 
 @dataclass
 class Action:
+    """同步操作单元，由 _compare 生成，_execute 消费。"""
     kind: str  # push | pull | conflict | delete_pc | delete_tablet
     path: str
     reason: str = ""
@@ -103,9 +114,15 @@ class Config:
         return self._data.get("ignore_patterns", [])
 
     def is_ignored(self, rel_path: str) -> bool:
+        """检查文件是否匹配任一忽略模式。
+
+        目录模式（以 / 结尾）：匹配该目录下的所有子孙文件。
+        例如 ".trash/" 可同时匹配 ".trash/file.md" 和 ".trash/sub/x.md"。
+        """
         for pat in self.ignore_patterns:
             if fnmatch.fnmatch(rel_path, pat):
                 return True
+            # 目录模式：路径以该前缀开头 或 路径+/ 匹配 模式+*
             if pat.endswith("/") and (
                 rel_path.startswith(pat) or fnmatch.fnmatch(rel_path + "/", pat + "*")
             ):
@@ -122,6 +139,11 @@ class ADB:
         self._adb = adb_path
 
     def _run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        """执行 adb 命令，统一处理编码。
+
+        必须指定 encoding='utf-8'：Windows 中文版 subprocess 默认用 GBK 解码，
+        而 adb 输出（尤其是平板上的中文文件名）是 UTF-8，不指定会 UnicodeDecodeError。
+        """
         return subprocess.run(
             [self._adb] + list(args),
             capture_output=True,
@@ -139,9 +161,12 @@ class ADB:
         return len(devices) >= 1
 
     def get_files(self, vault_path: str) -> dict[str, FileInfo]:
-        """Scan tablet vault, return {rel_path: FileInfo}. Skip ignored & dirs."""
-        # List all files with mtime and size using find + stat
-        # Output format: <epoch_mtime>\t<rel_path>
+        """扫描平板 vault，返回 {相对路径: FileInfo}。
+
+        用 find + stat 一次拿到所有文件的 mtime，再逐个 md5sum 取哈希。
+        哈希计算是 O(n) 次 adb shell 调用，大 vault 可能慢，但对于笔记量级足够了。
+        """
+        # find 遍历所有文件，stat -c '%Y\t%n' 输出「Unix时间戳\t相对路径」
         cmd = (
             f"cd '{vault_path}' 2>/dev/null && "
             f"find . -type f -exec stat -c '%Y\t%n' {{}} \\; 2>/dev/null || true"
@@ -156,12 +181,11 @@ class ADB:
                 mtime = float(mtime_str)
             except ValueError:
                 continue
-            # Normalize: remove leading ./ and convert to forward slash
+            # removeprefix 而非 lstrip：lstrip("./") 会把 .obsidian 的 . 也吃掉
             rel_path = rel_path.removeprefix("./").replace("\\", "/")
             if not rel_path:
                 continue
             file_path = f"{vault_path}/{rel_path}"
-            # Get hash (use first 16 chars of MD5 for compactness)
             try:
                 hr = self._run("shell", f"md5sum '{file_path}' 2>/dev/null || true")
                 file_hash = hr.stdout.strip().split()[0] if hr.stdout.strip() else "-"
@@ -177,7 +201,10 @@ class ADB:
         return r.returncode == 0
 
     def push(self, pc_file: Path, tablet_file: str) -> bool:
-        """Push a single file from PC to tablet."""
+        """推送单个文件到平板。
+
+        adb push 不会自动创建目标目录，需要先 mkdir -p 确保父目录存在。
+        """
         tablet_dir = "/".join(tablet_file.split("/")[:-1])
         if tablet_dir:
             self._run("shell", f"mkdir -p '{tablet_dir}'", check=False)
@@ -301,7 +328,11 @@ class GitManager:
 # ── Core Sync Engine ─────────────────────────────────────────────────────────
 
 class ObsidianSync:
-    """Bidirectional sync with three-way comparison."""
+    """双向同步引擎，核心算法是三向比对（three-way comparison）。
+
+    三向 = PC 当前状态 + 平板当前状态 + 上次同步后的记录状态。
+    通过比较每侧当前 mtime/hash 与记录的 mtime/hash，判断谁变了。
+    """
 
     def __init__(self, config: Config, adb: ADB):
         self._cfg = config
@@ -312,7 +343,11 @@ class ObsidianSync:
     # ── Scanning ──────────────────────────────────────────────────────────
 
     def _scan_pc(self) -> dict[str, FileInfo]:
-        """Walk PC vault, return {rel_path: FileInfo}. Ignores hidden/sync files."""
+        """遍历 PC vault，返回所有非忽略文件的快照。
+
+        对每个文件计算 MD5 哈希——用于冲突检测中区分「mtime 变了但内容没变」
+        （例如 git checkout 可能修改 mtime 但内容不变）。
+        """
         files: dict[str, FileInfo] = {}
         vault = self._cfg.pc_vault
         if not vault.is_dir():
@@ -352,6 +387,27 @@ class ObsidianSync:
         state: SyncState,
         has_prev_state: bool,
     ) -> list[Action]:
+        """三向比对：PC 快照 vs 平板快照 vs 上次同步状态 → 操作列表。
+
+        对每个文件路径，分四种场景：
+
+        【两边都有】
+          - 两边都没变 → SKIP
+          - 只有 PC 变 → PUSH
+          - 只有平板变 → PULL
+          - 两边都变 → CONFLICT（保留两份）
+
+        【只有 PC 有】
+          - 状态记录显示平板曾有此文件 → 平板端被删了
+            - PC 也改了 → 冲突，恢复推回平板
+            - PC 没改 → propagate: 删 PC / ignore: 略过
+          - 状态无记录 → 纯新增 → PUSH
+
+        【只有平板有】
+          - 状态记录显示 PC 曾有此文件 → PC 端被删了（同上逻辑镜像）
+
+        【都没有，但状态有记录】→ 两边都删了，从状态中移除，不产生操作
+        """
         actions: list[Action] = []
         all_keys = set(pc) | set(tablet)
         if has_prev_state:
@@ -366,9 +422,8 @@ class ObsidianSync:
             tab_info = tablet.get(key)
 
             if in_pc and in_tab:
-                # File exists on both sides
                 if not in_state:
-                    # Never synced before — both created independently: conflict
+                    # 首次同步前两边独立创建了同名文件 → 冲突
                     actions.append(Action("conflict", key, "both new"))
                     continue
 
@@ -387,12 +442,9 @@ class ObsidianSync:
                     actions.append(Action("push", key, "pc modified"))
                 elif tab_changed:
                     actions.append(Action("pull", key, "tablet modified"))
-                # else: unchanged, skip
 
             elif in_pc and not in_tab:
-                # Only on PC
                 if in_state and state.tablet_mtime(key) is not None:
-                    # Tablet had it, now deleted
                     pc_changed = (
                         pc_info.mtime != state.pc_mtime(key)
                         or pc_info.hash != state.pc_hash(key)
@@ -401,14 +453,11 @@ class ObsidianSync:
                         actions.append(Action("push", key, "tablet deleted, pc modified"))
                     elif self._cfg.delete_strategy == "propagate":
                         actions.append(Action("delete_pc", key, "propagating tablet deletion"))
-                    # else: ignore — whatever strategy dictates
                 else:
                     actions.append(Action("push", key, "new on pc"))
 
             elif not in_pc and in_tab:
-                # Only on tablet
                 if in_state and state.pc_mtime(key) is not None:
-                    # PC had it, now deleted
                     tab_changed = (
                         tab_info.mtime != state.tablet_mtime(key)
                         or tab_info.hash != state.tablet_hash(key)
@@ -420,7 +469,7 @@ class ObsidianSync:
                 else:
                     actions.append(Action("pull", key, "new on tablet"))
 
-            # else: neither side has it — was deleted on both, remove from state silently
+            # 都不存在：曾同步过的文件被两边都删了 → 静默从状态中移除
 
         return actions
 
@@ -482,52 +531,57 @@ class ObsidianSync:
     # ── Main Flow ─────────────────────────────────────────────────────────
 
     def sync(self, dry_run: bool = False) -> bool:
-        """Run a full sync cycle. Returns True on success."""
+        """执行一次完整同步周期。
 
-        # 1. Verify ADB
+        生命周期：前置快照 → 扫描 → 比对 → 执行 → 重新扫描 → 后置提交 → 保存状态
+
+        前置快照（pre-sync commit）确保即使同步过程中出错，当前 PC 状态已被保存。
+        后置重新扫描是必需的：adb pull/push 后文件 mtime 会变，必须用新值更新状态，
+        否则下次同步会误判为「两边都变了」。
+        """
+        # 1. 检查 ADB 连接
         if not self._adb.check_device():
             print("Error: No ADB device connected. Check USB cable and USB debugging.")
             return False
 
-        # 2. Verify PC vault
+        # 2. 检查 PC vault 存在
         vault = self._cfg.pc_vault
         if not vault.is_dir():
             print(f"Error: PC vault not found at '{vault}'")
             return False
 
-        # 3. Verify Git
+        # 3. 检查 Git 仓库
         if not self._git.is_repo():
             print(f"Warning: '{vault}' is not a git repo. Run --init first.")
             return False
 
-        # 4. Load previous state
+        # 4. 加载上次同步状态
         has_state = self._state.load()
 
-        # 5. Pre-sync snapshot commit
+        # 5. 前置快照：保存当前 PC 状态到 Git
         if not dry_run and self._git.has_changes():
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._git.commit(f"pre-sync snapshot: {ts}")
             print(f"📸 Pre-sync snapshot committed")
 
-        # 6. Scan both sides
+        # 6. 扫描两边
         print("Scanning...")
         pc_files = self._scan_pc()
         tablet_files = self._scan_tablet()
         print(f"  PC:      {len(pc_files)} files")
         print(f"  Tablet:  {len(tablet_files)} files")
 
-        # 7. Compare
+        # 7. 三向比对
         actions = self._compare(pc_files, tablet_files, self._state, has_state)
 
         if not actions:
             print("Already in sync.")
-            # Re-scan to capture current reality
             pc_files = self._scan_pc()
             tablet_files = self._scan_tablet()
             self._save_post_state(pc_files, tablet_files)
             return True
 
-        # 8. Show plan
+        # 8. 展示操作计划
         counts = {"push": 0, "pull": 0, "conflict": 0, "delete_pc": 0, "delete_tablet": 0}
         for a in actions:
             counts[a.kind] += 1
@@ -547,16 +601,18 @@ class ObsidianSync:
             print("\n[Dry run — no changes made]")
             return True
 
-        # 9. Execute
+        # 9. 执行操作
         print()
         pushed, pulled, conflicts, del_pc, del_tab = self._execute(actions)
 
-        # 10. Re-scan and save new state (post-sync reality)
+        # 10. 关键：重新扫描两边再保存状态
+        # adb pull/push 之后文件的 mtime 是操作完成的时间，不是原始修改时间。
+        # 必须用执行后的 mtime 建立新基线，否则下次同步会误判变更。
         pc_files = self._scan_pc()
         tablet_files = self._scan_tablet()
         self._save_post_state(pc_files, tablet_files)
 
-        # 11. Post-sync commit
+        # 11. 后置提交：记录本次同步变更
         parts = []
         if pulled:
             parts.append(f"pulled {pulled}")
@@ -573,7 +629,11 @@ class ObsidianSync:
         return True
 
     def _save_post_state(self, pc: dict[str, FileInfo], tablet: dict[str, FileInfo]):
-        """Recompute state from current reality (post-sync) so we match exactly."""
+        """用当前扫描结果重建同步状态。
+
+        必须在同步操作执行后调用，且传入的 pc/tablet 必须是最新扫描结果。
+        旧状态完全被替换——因为它是基线，不是日志。
+        """
         self._state.files = {}
         all_keys = set(pc) | set(tablet)
         for key in all_keys:
