@@ -12,6 +12,10 @@
 <!-- Top Bar -->
 <header id="topbar">
   <span id="brand">Obsidian Sync</span>
+  <div id="vault-selector" class="vault-selector">
+    <span id="vault-path" class="dim" title="点击更换库文件夹">📁 加载中...</span>
+    <button id="btn-change-vault" class="btn-small" title="更换库文件夹">切换</button>
+  </div>
   <span id="status-badge" class="badge">checking...</span>
   <span id="file-count" class="dim"></span>
   <button id="btn-dry-run" class="btn-outline">预览</button>
@@ -76,6 +80,19 @@
     <button id="search-submit" class="btn-primary">搜索</button>
     <div id="search-results"></div>
     <button class="btn-outline modal-close">关闭</button>
+  </div>
+</div>
+
+<!-- Folder Browser Modal -->
+<div id="browse-modal" class="modal hidden">
+  <div class="modal-box browse-box">
+    <h3>选择 Obsidian 库文件夹</h3>
+    <div id="browse-breadcrumb" class="browse-breadcrumb"></div>
+    <div id="browse-list" class="browse-list"></div>
+    <div class="browse-footer">
+      <button id="browse-select" class="btn-primary" disabled>选择此文件夹</button>
+      <button class="btn-outline modal-close">取消</button>
+    </div>
   </div>
 </div>
 

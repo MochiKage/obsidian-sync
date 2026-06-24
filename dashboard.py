@@ -26,21 +26,50 @@ app.secret_key = "obsidian-sync-dashboard"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 
-cfg = Config(CONFIG_PATH)
-adb = ADB(cfg.adb_path)
-sync_engine = ObsidianSync(cfg, adb)
-vault = cfg.pc_vault
-git = GitManager(vault)
+
+class AppState:
+    """Mutable global state — reloaded when the user switches vault folders."""
+
+    def __init__(self):
+        self.cfg: Config = Config(CONFIG_PATH)
+        self.adb: ADB = ADB(self.cfg.adb_path)
+        self.sync_engine: ObsidianSync = ObsidianSync(self.cfg, self.adb)
+        self.vault: Path = self.cfg.pc_vault
+        self.git: GitManager = GitManager(self.vault)
+
+    def reload(self, new_vault_path: str | None = None):
+        """Reload config and reinitialize all components.
+
+        If new_vault_path is provided, it is written to config.json first.
+        """
+        if new_vault_path is not None:
+            raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            raw["pc_vault_path"] = new_vault_path
+            CONFIG_PATH.write_text(
+                json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+        self.cfg = Config(CONFIG_PATH)
+        self.adb = ADB(self.cfg.adb_path)
+        self.sync_engine = ObsidianSync(self.cfg, self.adb)
+        self.vault = self.cfg.pc_vault
+        self.git = GitManager(self.vault)
+
+
+state = AppState()
+
 
 # ── Sync Logger ────────────────────────────────────────────────────────────────
 
 class SyncLogger:
     """Capture and persist sync operation output so users can review what happened."""
 
-    def __init__(self, vault_path: Path):
-        self._path = vault_path / ".sync_log.json"
+    def __init__(self):
         self._max = 100
         self._current: dict | None = None
+
+    @property
+    def _path(self) -> Path:
+        return state.vault / ".sync_log.json"
 
     def start(self, dry_run: bool = False) -> str:
         jid = datetime.now().strftime("%Y%m%d%H%M%S%f")[:17]
@@ -65,7 +94,6 @@ class SyncLogger:
         logs = self._load()
         logs.insert(0, self._current)
         self._current = None
-        # Keep only the last N entries
         self._save(logs[: self._max])
 
     def get_all(self, limit: int = 30) -> list[dict]:
@@ -92,19 +120,19 @@ class SyncLogger:
         )
 
 
-logger = SyncLogger(vault)
+logger = SyncLogger()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _device_available() -> bool:
-    return adb.check_device()
+    return state.adb.check_device()
 
 
 def _run_git(*args: str) -> str:
     """Run a git command in the vault repo and return stdout."""
     r = subprocess.run(
         ["git"] + list(args),
-        cwd=vault,
+        cwd=state.vault,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -124,8 +152,8 @@ def _iso(ts: float | None) -> str | None:
 @app.route("/api/status")
 def api_status():
     pc_count = 0
-    if vault.is_dir():
-        pc_count = sum(1 for _ in vault.rglob("*") if _.is_file()
+    if state.vault.is_dir():
+        pc_count = sum(1 for _ in state.vault.rglob("*") if _.is_file()
                        and ".git/" not in str(_)
                        and ".syncstate.json" not in str(_))
 
@@ -134,20 +162,20 @@ def api_status():
     if _device_available():
         tab_available = True
         try:
-            raw = adb.get_files(cfg.tablet_vault)
-            tab_count = len([k for k in raw if not cfg.is_ignored(k)])
+            raw = state.adb.get_files(state.cfg.tablet_vault)
+            tab_count = len([k for k in raw if not state.cfg.is_ignored(k)])
         except Exception:
             tab_count = -1  # error
 
     # Determine sync status by running a dry comparison
-    state = SyncState(Path(STATE_PATH_TEMPLATE.format(vault=vault)))
-    has_state = state.load()
+    sync_state = SyncState(Path(STATE_PATH_TEMPLATE.format(vault=state.vault)))
+    has_state = sync_state.load()
 
     sync_status = "unknown"
     if tab_available and has_state:
-        pc_files = sync_engine._scan_pc()
-        tablet_files = sync_engine._scan_tablet()
-        actions = sync_engine._compare(pc_files, tablet_files, state, has_state)
+        pc_files = state.sync_engine._scan_pc()
+        tablet_files = state.sync_engine._scan_tablet()
+        actions = state.sync_engine._compare(pc_files, tablet_files, sync_state, has_state)
         conflicts = sum(1 for a in actions if a.kind == "conflict")
         if conflicts > 0:
             sync_status = "conflict"
@@ -161,7 +189,7 @@ def api_status():
         "tablet_files": tab_count,
         "tablet_available": tab_available,
         "status": sync_status,
-        "last_sync": state.last_sync if has_state else None,
+        "last_sync": sync_state.last_sync if has_state else None,
     })
 
 
@@ -171,17 +199,17 @@ def api_status():
 def api_files():
     filter_type = request.args.get("filter", "all")
 
-    pc_files = sync_engine._scan_pc()
+    pc_files = state.sync_engine._scan_pc()
     tablet_files = {}
     if _device_available():
         try:
-            tablet_files = sync_engine._scan_tablet()
+            tablet_files = state.sync_engine._scan_tablet()
         except Exception:
             pass
 
-    state = SyncState(Path(STATE_PATH_TEMPLATE.format(vault=vault)))
-    has_state = state.load()
-    actions = sync_engine._compare(pc_files, tablet_files, state, has_state)
+    sync_state = SyncState(Path(STATE_PATH_TEMPLATE.format(vault=state.vault)))
+    has_state = sync_state.load()
+    actions = state.sync_engine._compare(pc_files, tablet_files, sync_state, has_state)
 
     action_map: dict[str, str] = {}
     for a in actions:
@@ -189,7 +217,7 @@ def api_files():
 
     all_keys = set(pc_files) | set(tablet_files)
     if has_state:
-        all_keys |= set(state.files)
+        all_keys |= set(sync_state.files)
 
     files = []
     for key in sorted(all_keys):
@@ -224,7 +252,7 @@ def api_sync():
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
-            success = sync_engine.sync(dry_run=dry_run)
+            success = state.sync_engine.sync(dry_run=dry_run)
         output = buf.getvalue()
         logger.write(output)
         logger.finish(success)
@@ -260,7 +288,7 @@ def api_history():
     page = int(request.args.get("page", 0))
     per_page = int(request.args.get("per_page", 30))
 
-    if not git.is_repo():
+    if not state.git.is_repo():
         return jsonify({"commits": [], "total": 0})
 
     # Get total count
@@ -304,7 +332,7 @@ def api_history():
 
 @app.route("/api/diff/<commit_hash>")
 def api_diff(commit_hash: str):
-    if not git.is_repo():
+    if not state.git.is_repo():
         return jsonify({"error": "Not a git repository"}), 400
 
     # Get commit info
@@ -337,7 +365,7 @@ def api_file_content():
     if not path:
         return jsonify({"error": "Missing path"}), 400
 
-    file_path = vault / path
+    file_path = state.vault / path
     if not file_path.exists():
         return jsonify({"error": "File not found"}), 404
 
@@ -362,15 +390,15 @@ def api_resolve():
 
     if action == "keep_tablet":
         # Overwrite PC file with tablet version
-        tablet_file = f"{cfg.tablet_vault}/{path}"
-        pc_file = vault / path
-        ok = adb.pull(tablet_file, pc_file)
+        tablet_file = f"{state.cfg.tablet_vault}/{path}"
+        pc_file = state.vault / path
+        ok = state.adb.pull(tablet_file, pc_file)
     else:
         # keep_pc: just remove the .conflict.md if it exists
         ok = True
 
     # Remove conflict marker file if exists
-    conflict_file = vault / f"{Path(path).stem}.conflict{Path(path).suffix}"
+    conflict_file = state.vault / f"{Path(path).stem}.conflict{Path(path).suffix}"
     try:
         conflict_file.unlink()
     except OSError:
@@ -387,7 +415,7 @@ def api_search():
     if not q or len(q) < 2:
         return jsonify({"results": []})
 
-    if not git.is_repo():
+    if not state.git.is_repo():
         return jsonify({"results": []})
 
     # git log -S searches for commits that changed the number of occurrences of a string
@@ -415,7 +443,7 @@ def api_search():
 
 @app.route("/api/health")
 def api_health():
-    if not vault.is_dir():
+    if not state.vault.is_dir():
         return jsonify({"error": "Vault not found"}), 404
 
     issues = []
@@ -425,10 +453,10 @@ def api_health():
     all_refs: set[str] = set()
     non_md_files: list[Path] = []
 
-    for f in vault.rglob("*"):
+    for f in state.vault.rglob("*"):
         if not f.is_file():
             continue
-        rel = str(f.relative_to(vault))
+        rel = str(f.relative_to(state.vault))
         if ".git/" in rel or ".syncstate.json" in rel:
             continue
         if f.suffix.lower() == ".md":
@@ -453,17 +481,17 @@ def api_health():
 
     # Check which non-md files are orphaned
     md_names = {f.stem for f in md_files}
-    md_paths = {str(f.relative_to(vault)).replace("\\", "/") for f in md_files}
+    md_paths = {str(f.relative_to(state.vault)).replace("\\", "/") for f in md_files}
     # Also map stems to paths for loose matching
     stem_to_paths: dict[str, list[str]] = {}
     for f in md_files:
         stem = f.stem
-        rel = str(f.relative_to(vault)).replace("\\", "/")
+        rel = str(f.relative_to(state.vault)).replace("\\", "/")
         stem_to_paths.setdefault(stem, []).append(rel)
 
     orphans = []
     for f in non_md_files:
-        rel = str(f.relative_to(vault)).replace("\\", "/")
+        rel = str(f.relative_to(state.vault)).replace("\\", "/")
         name = f.name
         stem = f.stem
         is_referenced = (
@@ -506,7 +534,7 @@ def api_health():
                 )
                 if not found:
                     broken_links.append({
-                        "source": str(f.relative_to(vault)).replace("\\", "/"),
+                        "source": str(f.relative_to(state.vault)).replace("\\", "/"),
                         "target": target,
                     })
         except Exception:
@@ -522,12 +550,12 @@ def api_health():
 
     # 3. Large files (>5MB)
     large_files = []
-    for f in vault.rglob("*"):
+    for f in state.vault.rglob("*"):
         if not f.is_file():
             continue
         size = f.stat().st_size
         if size > 5 * 1024 * 1024:
-            rel = str(f.relative_to(vault)).replace("\\", "/")
+            rel = str(f.relative_to(state.vault)).replace("\\", "/")
             if ".git/" not in rel:
                 large_files.append({"path": rel, "size": size})
 
@@ -545,6 +573,90 @@ def api_health():
     })
 
 
+# ── API: Config ───────────────────────────────────────────────────────────────
+
+@app.route("/api/config", methods=["GET", "POST"])
+def api_config():
+    if request.method == "POST":
+        data = request.get_json()
+        new_path = data.get("pc_vault_path", "").strip()
+        if not new_path:
+            return jsonify({"ok": False, "error": "Path is required"}), 400
+
+        p = Path(new_path)
+        if not p.is_absolute():
+            return jsonify({"ok": False, "error": "Must be an absolute path"}), 400
+
+        # Switch vault, reload all state
+        old_vault = str(state.vault)
+        state.reload(new_path)
+
+        # Initialize the new vault
+        p.mkdir(parents=True, exist_ok=True)
+        if not state.git.is_repo():
+            state.git.init()
+        state.sync_engine.init()
+
+        return jsonify({
+            "ok": True,
+            "pc_vault_path": str(state.vault),
+            "previous_path": old_vault,
+        })
+
+    # GET: return current config
+    return jsonify({
+        "pc_vault_path": str(state.vault),
+        "tablet_vault_path": state.cfg.tablet_vault,
+        "pc_vault_exists": state.vault.is_dir(),
+    })
+
+
+# ── API: Browse ───────────────────────────────────────────────────────────────
+
+@app.route("/api/browse")
+def api_browse():
+    """List subdirectories of a given path for folder navigation."""
+    base = request.args.get("path", "").strip()
+
+    # Resolve the path: if empty, list drives; otherwise list subdirs
+    if not base:
+        drives = []
+        for letter in "CDEFGH":
+            p = Path(f"{letter}:/")
+            if p.exists():
+                drives.append({"path": str(p), "name": f"{letter}:\\", "type": "drive"})
+        return jsonify({"path": "", "entries": drives})
+
+    p = Path(base)
+    if not p.exists():
+        return jsonify({"path": base, "entries": [], "error": "Path not found"})
+    if not p.is_dir():
+        return jsonify({"path": base, "entries": [], "error": "Not a directory"})
+
+    entries = []
+    try:
+        for item in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+            if item.name.startswith("$") or item.name.startswith("."):
+                continue
+            if item.is_dir():
+                entries.append({
+                    "path": str(item).replace("\\", "/"),
+                    "name": item.name,
+                    "type": "dir",
+                })
+    except PermissionError:
+        pass
+
+    # Add parent navigation
+    parent = str(p.parent).replace("\\", "/") if p.parent != p else ""
+
+    return jsonify({
+        "path": base.replace("\\", "/"),
+        "parent": parent,
+        "entries": entries,
+    })
+
+
 # ── Main Page ─────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -555,6 +667,6 @@ def index():
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print(f"PC vault: {vault}")
+    print(f"PC vault: {state.vault}")
     print(f"Dashboard: http://localhost:8820")
     app.run(host="127.0.0.1", port=8820, debug=True)

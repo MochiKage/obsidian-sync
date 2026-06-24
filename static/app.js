@@ -383,5 +383,138 @@ function formatDuration(sec) {
   return `${m}m${s}s`;
 }
 
+// ── Vault Selector ───────────────────────────────────────────────────────────
+
+async function loadCurrentVault() {
+  try {
+    const data = await api("/api/config");
+    const el = document.getElementById("vault-path");
+    el.textContent = "📁 " + data.pc_vault_path;
+    el.title = data.pc_vault_path;
+  } catch (e) {
+    document.getElementById("vault-path").textContent = "📁 (加载失败)";
+  }
+}
+
+document.getElementById("btn-change-vault").addEventListener("click", openFolderBrowser);
+document.getElementById("vault-path").addEventListener("click", openFolderBrowser);
+
+let browsePath = "";
+let selectedPath = "";
+
+async function openFolderBrowser() {
+  document.getElementById("browse-modal").classList.remove("hidden");
+  browsePath = "";
+  selectedPath = "";
+  await navigateBrowser("");
+}
+
+async function navigateBrowser(path) {
+  browsePath = path;
+  const data = await api(`/api/browse?path=${encodeURIComponent(path)}`);
+
+  // Breadcrumb
+  const bread = document.getElementById("browse-breadcrumb");
+  if (!path) {
+    bread.innerHTML = '<span class="browse-crumb" onclick="navigateBrowser(\'\')">此电脑</span>';
+  } else {
+    const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
+    let acc = "";
+    let html = '<span class="browse-crumb" onclick="navigateBrowser(\'\')">此电脑</span>';
+    for (const part of parts) {
+      acc += (acc ? "/" : "") + part;
+      html += '<span class="browse-sep">/</span>';
+      html += `<span class="browse-crumb" onclick="navigateBrowser('${acc.replace(/'/g, "\\'")}')">${esc(part)}</span>`;
+    }
+    bread.innerHTML = html;
+  }
+
+  // Entry list
+  const list = document.getElementById("browse-list");
+  list.innerHTML = "";
+
+  // Parent
+  if (data.parent !== undefined && data.path) {
+    const div = document.createElement("div");
+    div.className = "browse-entry";
+    div.innerHTML = '<span class="icon">📂</span><span class="name">..</span>';
+    div.addEventListener("click", () => navigateBrowser(data.parent));
+    list.appendChild(div);
+  }
+
+  // Directories
+  for (const entry of (data.entries || [])) {
+    const div = document.createElement("div");
+    div.className = "browse-entry";
+    if (entry.path.replace(/\\/g, "/") === selectedPath.replace(/\\/g, "/")) {
+      div.classList.add("selected");
+    }
+    const icon = entry.type === "drive" ? "💽" : "📁";
+    div.innerHTML = `<span class="icon">${icon}</span><span class="name">${esc(entry.name)}</span>`;
+    div.addEventListener("click", () => selectFolder(entry.path, div));
+    div.addEventListener("dblclick", () => {
+      selectFolder(entry.path, div);
+      navigateBrowser(entry.path);
+    });
+    list.appendChild(div);
+  }
+
+  // Update select button
+  const btn = document.getElementById("browse-select");
+  btn.disabled = !selectedPath;
+  btn.textContent = selectedPath ? `选择: ${selectedPath}` : "选择此文件夹 (先点击文件夹选中)";
+}
+
+function selectFolder(path, element) {
+  selectedPath = path;
+  document.querySelectorAll(".browse-entry").forEach(e => e.classList.remove("selected"));
+  if (element) element.classList.add("selected");
+  const btn = document.getElementById("browse-select");
+  btn.disabled = false;
+  btn.textContent = `选择: ${getShortPath(path)}`;
+}
+
+function getShortPath(p) {
+  // Show last 2 segments for display
+  const parts = p.replace(/\\/g, "/").replace(/\/$/, "").split("/");
+  if (parts.length <= 2) return p;
+  return ".../" + parts.slice(-2).join("/");
+}
+
+document.getElementById("browse-select").addEventListener("click", async () => {
+  if (!selectedPath) return;
+  const btn = document.getElementById("browse-select");
+  btn.textContent = "切换中...";
+  btn.disabled = true;
+
+  try {
+    const res = await api("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pc_vault_path: selectedPath }),
+    });
+    if (res.ok) {
+      document.getElementById("browse-modal").classList.add("hidden");
+      loadCurrentVault();
+      loadAll();
+    } else {
+      alert("切换失败: " + (res.error || "未知错误"));
+    }
+  } catch (e) {
+    alert("请求失败: " + e);
+  } finally {
+    btn.textContent = "选择此文件夹";
+    btn.disabled = false;
+  }
+});
+
+// Close folder browser on background click
+document.getElementById("browse-modal").addEventListener("click", (e) => {
+  if (e.target === document.getElementById("browse-modal")) {
+    document.getElementById("browse-modal").classList.add("hidden");
+  }
+});
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 loadAll();
+loadCurrentVault();
