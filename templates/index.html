@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Obsidian Sync Dashboard</title>
+<link rel="stylesheet" href="https://unpkg.com/diff2html@3.4.47/bundles/css/diff2html.min.css"/>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- Top Bar -->
+<header id="topbar">
+  <span id="brand">Obsidian Sync</span>
+  <span id="status-badge" class="badge">checking...</span>
+  <span id="file-count" class="dim"></span>
+  <button id="btn-dry-run" class="btn-outline">预览</button>
+  <button id="btn-sync" class="btn-primary">立即同步</button>
+</header>
+
+<!-- Main Layout -->
+<div id="main">
+
+  <!-- Left Column: File List -->
+  <section id="panel-files" class="panel">
+    <div class="panel-header">
+      <h2>文件状态</h2>
+      <select id="filter-select">
+        <option value="all">全部</option>
+        <option value="pending">待同步</option>
+        <option value="conflict">冲突</option>
+      </select>
+    </div>
+    <div id="file-list" class="scroll-list"></div>
+  </section>
+
+  <!-- Middle Column: History -->
+  <section id="panel-history" class="panel">
+    <div class="panel-header">
+      <h2>变更历史</h2>
+      <button id="btn-search" class="btn-small">🔍</button>
+    </div>
+    <div id="history-list" class="scroll-list"></div>
+  </section>
+
+  <!-- Right Column: Detail / Diff -->
+  <section id="panel-detail" class="panel">
+    <div class="panel-header">
+      <h2 id="detail-title">详情</h2>
+      <div id="detail-actions"></div>
+    </div>
+    <div id="detail-content" class="scroll-list">
+      <div class="placeholder">点击左侧文件或中间历史记录<br>查看 diff 详情</div>
+    </div>
+  </section>
+
+</div>
+
+<!-- Bottom Bar -->
+<footer id="bottombar">
+  <span id="health-summary" class="dim">健康检查中...</span>
+  <span id="last-sync-time" class="dim"></span>
+</footer>
+
+<!-- Search Modal -->
+<div id="search-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>搜索变更历史</h3>
+    <input type="text" id="search-input" placeholder="输入关键词...">
+    <button id="search-submit" class="btn-primary">搜索</button>
+    <div id="search-results"></div>
+    <button class="btn-outline modal-close">关闭</button>
+  </div>
+</div>
+
+<script src="https://unpkg.com/diff2html@3.4.47/bundles/js/diff2html-ui.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
