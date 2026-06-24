@@ -411,6 +411,11 @@ async function openFolderBrowser() {
 
 async function navigateBrowser(path) {
   browsePath = path;
+
+  // Show loading
+  const list = document.getElementById("browse-list");
+  list.innerHTML = '<div class="browse-entry"><span class="name dim">加载中...</span></div>';
+
   const data = await api(`/api/browse?path=${encodeURIComponent(path)}`);
 
   // Breadcrumb
@@ -430,7 +435,6 @@ async function navigateBrowser(path) {
   }
 
   // Entry list
-  const list = document.getElementById("browse-list");
   list.innerHTML = "";
 
   // Parent

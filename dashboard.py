@@ -8,6 +8,7 @@ Then visit: http://localhost:8820
 import contextlib
 import io
 import json
+import os
 import re
 import subprocess
 from datetime import datetime
@@ -633,27 +634,39 @@ def api_browse():
     if not p.is_dir():
         return jsonify({"path": base, "entries": [], "error": "Not a directory"})
 
-    entries = []
+    # Use os.scandir() — DirEntry.is_dir() is free (comes from FindNextFile on Windows),
+    # whereas Path.is_dir() triggers a separate stat() call per item, which is
+    # catastrophically slow on drive roots with hundreds of entries.
+    dirs = []
     try:
-        for item in sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-            if item.name.startswith("$") or item.name.startswith("."):
-                continue
-            if item.is_dir():
-                entries.append({
-                    "path": str(item).replace("\\", "/"),
-                    "name": item.name,
-                    "type": "dir",
-                })
-    except PermissionError:
+        with os.scandir(p) as it:
+            for entry in it:
+                if entry.name.startswith("$") or entry.name.startswith("."):
+                    continue
+                try:
+                    if entry.is_dir():
+                        dirs.append({
+                            "path": entry.path.replace("\\", "/"),
+                            "name": entry.name,
+                            "type": "dir",
+                        })
+                except OSError:
+                    pass  # skip entries we can't stat (e.g. broken junctions)
+    except (PermissionError, OSError):
         pass
 
-    # Add parent navigation
-    parent = str(p.parent).replace("\\", "/") if p.parent != p else ""
+    dirs.sort(key=lambda d: d["name"].lower())
+
+    # Add parent navigation (only if we're not at a drive root)
+    parent_path = str(p.parent).replace("\\", "/")
+    # A drive root like "C:/" has parent "C:" which means we should show "this PC"
+    if parent_path.rstrip("/") == base.rstrip("/").split("/")[0]:
+        parent_path = ""  # navigate back to drive list
 
     return jsonify({
         "path": base.replace("\\", "/"),
-        "parent": parent,
-        "entries": entries,
+        "parent": parent_path if parent_path != base.replace("\\", "/") else "",
+        "entries": dirs,
     })
 
 
