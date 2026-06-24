@@ -5,6 +5,8 @@
   "conflict_strategy": "keep_both",
   "delete_strategy": "propagate",
   "ignore_patterns": [
+    ".git/",
+    ".syncstate.json",
     ".obsidian/workspace*.json",
     ".obsidian/app.json",
     ".obsidian/appearance.json",

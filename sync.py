@@ -12,6 +12,10 @@ import json
 import os
 import subprocess
 import sys
+
+# Force UTF-8 output (Windows Chinese locale defaults to GBK)
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -153,7 +157,7 @@ class ADB:
             except ValueError:
                 continue
             # Normalize: remove leading ./ and convert to forward slash
-            rel_path = rel_path.lstrip("./").replace("\\", "/")
+            rel_path = rel_path.removeprefix("./").replace("\\", "/")
             if not rel_path:
                 continue
             file_path = f"{vault_path}/{rel_path}"
@@ -517,6 +521,9 @@ class ObsidianSync:
 
         if not actions:
             print("Already in sync.")
+            # Re-scan to capture current reality
+            pc_files = self._scan_pc()
+            tablet_files = self._scan_tablet()
             self._save_post_state(pc_files, tablet_files)
             return True
 
@@ -544,7 +551,9 @@ class ObsidianSync:
         print()
         pushed, pulled, conflicts, del_pc, del_tab = self._execute(actions)
 
-        # 10. Save new state
+        # 10. Re-scan and save new state (post-sync reality)
+        pc_files = self._scan_pc()
+        tablet_files = self._scan_tablet()
         self._save_post_state(pc_files, tablet_files)
 
         # 11. Post-sync commit
