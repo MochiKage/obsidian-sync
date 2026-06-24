@@ -122,6 +122,8 @@ class ADB:
             [self._adb] + list(args),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=check,
         )
 
@@ -257,7 +259,10 @@ class GitManager:
         return (self._repo / ".git").is_dir()
 
     def init(self):
-        subprocess.run(["git", "init"], cwd=self._repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "init"], cwd=self._repo, check=True,
+            capture_output=True, encoding="utf-8", errors="replace",
+        )
 
     def has_changes(self) -> bool:
         r = subprocess.run(
@@ -265,6 +270,8 @@ class GitManager:
             cwd=self._repo,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         return bool(r.stdout.strip())
 
@@ -274,13 +281,16 @@ class GitManager:
             cwd=self._repo,
             check=True,
             capture_output=True,
+            encoding="utf-8",
+            errors="replace",
         )
-        # Use --allow-empty only for initial snapshot
         subprocess.run(
             ["git", "commit", "-m", message],
             cwd=self._repo,
             check=True,
             capture_output=True,
+            encoding="utf-8",
+            errors="replace",
         )
 
 
