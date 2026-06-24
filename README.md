@@ -2,6 +2,8 @@
 
 PC ↔ Android 平板 Obsidian 库双向同步工具，附带 Git 版本管理和 Web 可视化面板。
 
+> [English](README_en.md)
+
 ## 功能
 
 | 模块 | 说明 |

@@ -2,6 +2,8 @@
 
 Bidirectional PC ↔ Android tablet Obsidian vault sync with Git versioning and a web dashboard.
 
+> [中文](README.md)
+
 ## Features
 
 | Module | Description |
