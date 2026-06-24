@@ -5,6 +5,8 @@ Start with: python dashboard.py
 Then visit: http://localhost:8820
 """
 
+import contextlib
+import io
 import json
 import re
 import subprocess
@@ -29,6 +31,68 @@ adb = ADB(cfg.adb_path)
 sync_engine = ObsidianSync(cfg, adb)
 vault = cfg.pc_vault
 git = GitManager(vault)
+
+# ── Sync Logger ────────────────────────────────────────────────────────────────
+
+class SyncLogger:
+    """Capture and persist sync operation output so users can review what happened."""
+
+    def __init__(self, vault_path: Path):
+        self._path = vault_path / ".sync_log.json"
+        self._max = 100
+        self._current: dict | None = None
+
+    def start(self, dry_run: bool = False) -> str:
+        jid = datetime.now().strftime("%Y%m%d%H%M%S%f")[:17]
+        self._current = {
+            "id": jid,
+            "start": datetime.now().isoformat(),
+            "dry_run": dry_run,
+            "output": "",
+            "status": "running",
+        }
+        return jid
+
+    def write(self, text: str):
+        if self._current is not None:
+            self._current["output"] += text
+
+    def finish(self, success: bool = True):
+        if self._current is None:
+            return
+        self._current["end"] = datetime.now().isoformat()
+        self._current["status"] = "success" if success else "failed"
+        logs = self._load()
+        logs.insert(0, self._current)
+        self._current = None
+        # Keep only the last N entries
+        self._save(logs[: self._max])
+
+    def get_all(self, limit: int = 30) -> list[dict]:
+        return self._load()[:limit]
+
+    def get_one(self, job_id: str) -> dict | None:
+        for entry in self._load():
+            if entry["id"] == job_id:
+                return entry
+        return None
+
+    def _load(self) -> list[dict]:
+        if not self._path.exists():
+            return []
+        try:
+            return json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+    def _save(self, data: list[dict]):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+
+logger = SyncLogger(vault)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -154,11 +218,39 @@ def api_files():
 @app.route("/api/sync", methods=["POST"])
 def api_sync():
     dry_run = request.args.get("dry_run") == "1"
+    job_id = logger.start(dry_run=dry_run)
+
+    # Capture all print() output from the sync engine so we can show it in the UI
+    buf = io.StringIO()
     try:
-        success = sync_engine.sync(dry_run=dry_run)
-        return jsonify({"ok": success})
+        with contextlib.redirect_stdout(buf):
+            success = sync_engine.sync(dry_run=dry_run)
+        output = buf.getvalue()
+        logger.write(output)
+        logger.finish(success)
+        return jsonify({"ok": success, "job_id": job_id, "output": output})
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        err_output = buf.getvalue()
+        logger.write(err_output)
+        logger.write(f"\n[ERROR] {e}\n")
+        logger.finish(False)
+        return jsonify({"ok": False, "error": str(e), "job_id": job_id}), 500
+
+
+# ── API: Logs ─────────────────────────────────────────────────────────────────
+
+@app.route("/api/logs")
+def api_logs():
+    limit = int(request.args.get("limit", 30))
+    return jsonify({"logs": logger.get_all(limit)})
+
+
+@app.route("/api/logs/<job_id>")
+def api_log_detail(job_id: str):
+    entry = logger.get_one(job_id)
+    if entry is None:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(entry)
 
 
 # ── API: History ──────────────────────────────────────────────────────────────

@@ -43,14 +43,20 @@
     <div id="history-list" class="scroll-list"></div>
   </section>
 
-  <!-- Right Column: Detail / Diff -->
+  <!-- Right Column: Detail / Diff / Log -->
   <section id="panel-detail" class="panel">
     <div class="panel-header">
-      <h2 id="detail-title">详情</h2>
+      <div class="tab-bar">
+        <button class="tab active" data-tab="detail">详情</button>
+        <button class="tab" data-tab="log">日志</button>
+      </div>
       <div id="detail-actions"></div>
     </div>
-    <div id="detail-content" class="scroll-list">
+    <div id="detail-content" class="scroll-list tab-content active" data-tab="detail">
       <div class="placeholder">点击左侧文件或中间历史记录<br>查看 diff 详情</div>
+    </div>
+    <div id="log-content" class="scroll-list tab-content" data-tab="log">
+      <div class="placeholder">同步操作日志<br>执行同步后在此显示</div>
     </div>
   </section>
 

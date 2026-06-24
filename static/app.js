@@ -1,12 +1,29 @@
 // ── State ────────────────────────────────────────────────────────────────────
 let currentFile = null;
 let currentCommit = null;
+let activeTab = "detail";
 
 // ── API Helpers ──────────────────────────────────────────────────────────────
 
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
   return res.json();
+}
+
+// ── Tabs ─────────────────────────────────────────────────────────────────────
+
+document.querySelectorAll(".tab").forEach(tab => {
+  tab.addEventListener("click", () => {
+    const tabName = tab.dataset.tab;
+    switchTab(tabName);
+    if (tabName === "log") loadLogs();
+  });
+});
+
+function switchTab(name) {
+  activeTab = name;
+  document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+  document.querySelectorAll(".tab-content").forEach(c => c.classList.toggle("active", c.dataset.tab === name));
 }
 
 // ── Page Load ────────────────────────────────────────────────────────────────
@@ -198,30 +215,37 @@ async function showDiff(hash) {
 
 async function doSync(dryRun = false) {
   const btn = document.getElementById("btn-sync");
-  btn.textContent = dryRun ? "预览中..." : "同步中...";
+  const dryBtn = document.getElementById("btn-dry-run");
+  btn.textContent = dryRun ? "立即同步" : "同步中...";
+  dryBtn.textContent = dryRun ? "预览中..." : "预览";
   btn.disabled = true;
+  dryBtn.disabled = true;
 
-  // Show a sync log area
+  // Show live output in detail tab
+  switchTab("detail");
   const content = document.getElementById("detail-content");
-  content.innerHTML = `<div id="sync-log" class="dim">${dryRun ? '预览变更...' : '正在同步...'}</div>`;
+  content.innerHTML = `<div id="sync-log" class="dim">${dryRun ? '🔍 预览变更...' : '⏳ 正在同步...'}</div>`;
   document.getElementById("detail-title").textContent = dryRun ? "预览" : "同步";
 
   try {
     const res = await api(`/api/sync?dry_run=${dryRun ? "1" : "0"}`, { method: "POST" });
     if (res.ok) {
+      document.getElementById("sync-log").textContent = res.output || "(无输出)";
+      document.getElementById("detail-title").textContent = dryRun ? "预览结果" : "同步结果";
       await loadAll();
-      if (!dryRun) {
-        loadHistory(); // refresh history after real sync
-      }
+      if (!dryRun) loadHistory();
+      loadLogs(); // refresh log tab too
     } else {
-      document.getElementById("sync-log").textContent += "\n错误: " + (res.error || "未知");
+      document.getElementById("sync-log").textContent += "\n\n❌ 错误: " + (res.error || "未知");
     }
   } catch (e) {
-    document.getElementById("sync-log").textContent += "\n请求失败: " + e;
+    document.getElementById("sync-log").textContent += "\n\n❌ 请求失败: " + e;
   }
 
   btn.textContent = "立即同步";
+  dryBtn.textContent = "预览";
   btn.disabled = false;
+  dryBtn.disabled = false;
 }
 
 document.getElementById("btn-sync").addEventListener("click", () => doSync(false));
@@ -312,6 +336,52 @@ document.addEventListener("keydown", (e) => {
     closeSearch();
   }
 });
+
+// ── Sync Logs ────────────────────────────────────────────────────────────────
+
+async function loadLogs() {
+  const data = await api("/api/logs");
+  const container = document.getElementById("log-content");
+  if (!data.logs || data.logs.length === 0) {
+    container.innerHTML = '<div class="placeholder">暂无同步日志<br>执行同步后在此显示</div>';
+    return;
+  }
+
+  container.innerHTML = data.logs.map(log => {
+    const statusIcon = log.status === "success" ? "✅" : log.status === "failed" ? "❌" : "🔄";
+    const statusClass = log.status === "success" ? "success" : log.status === "failed" ? "failed" : "running";
+    const startTime = new Date(log.start).toLocaleString("zh-CN");
+    const label = log.dry_run ? "预览" : "同步";
+    const duration = log.end ? formatDuration((new Date(log.end) - new Date(log.start)) / 1000) : "";
+    // Show first line of output as summary
+    const firstLine = (log.output || "").split("\n").find(l => l.trim()) || "";
+
+    return `
+      <div class="log-entry" onclick="toggleLog(this)">
+        <div class="log-entry-header">
+          <span class="log-status ${statusClass}">${statusIcon}</span>
+          <span class="log-time">${startTime}</span>
+          <span class="log-label">${label}</span>
+          <span class="log-duration">${duration}</span>
+        </div>
+        <div class="log-summary">${esc(firstLine)}</div>
+        <div class="log-body">${esc(log.output || "(无输出)")}</div>
+      </div>
+    `;
+  }).join("");
+}
+
+function toggleLog(el) {
+  el.classList.toggle("expanded");
+}
+
+function formatDuration(sec) {
+  if (sec < 1) return "<1s";
+  if (sec < 60) return `${Math.round(sec)}s`;
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m}m${s}s`;
+}
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 loadAll();

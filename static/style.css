@@ -143,6 +143,30 @@ button {
   letter-spacing: .5px;
 }
 
+/* ── Tabs ─────────────────────────────────────────────────────────── */
+.tab-bar {
+  display: flex;
+  gap: 2px;
+}
+
+.tab {
+  background: transparent;
+  color: var(--text-dim);
+  border: none;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-family: var(--font);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background .15s, color .15s;
+}
+
+.tab:hover { color: var(--text); background: var(--bg-hover); }
+.tab.active { color: var(--text); background: var(--bg-active); }
+
+.tab-content { display: none; }
+.tab-content.active { display: flex; flex-direction: column; }
+
 .scroll-list {
   flex: 1;
   overflow-y: auto;
@@ -384,4 +408,75 @@ button {
   margin: 10px 14px;
   max-height: 300px;
   overflow-y: auto;
+}
+
+/* ── Log Entries ──────────────────────────────────────────────────── */
+.log-entry {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background .1s;
+}
+
+.log-entry:hover { background: var(--bg-hover); }
+
+.log-entry-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.log-status {
+  font-size: 14px;
+  width: 20px;
+  text-align: center;
+}
+
+.log-status.success { color: var(--green); }
+.log-status.failed  { color: var(--red); }
+.log-status.running { color: var(--yellow); }
+
+.log-time {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.log-label {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--bg-hover);
+  color: var(--text-dim);
+}
+
+.log-duration {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-left: auto;
+}
+
+.log-body {
+  display: none;
+  margin-top: 8px;
+  padding: 10px;
+  background: var(--bg);
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  max-height: 400px;
+  overflow-y: auto;
+  color: var(--text-dim);
+}
+
+.log-entry.expanded .log-body { display: block; }
+
+.log-summary {
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
